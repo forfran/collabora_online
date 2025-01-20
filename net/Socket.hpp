@@ -138,6 +138,9 @@ public:
     static constexpr int MaximumSendBufferSize = 128 * 1024;
     static std::atomic<bool> InhibitThreadChecks;
 
+    // Unix Socket path used for unlink
+    static std::string SocketPath;
+
     enum class Type : uint8_t { IPv4, IPv6, All, Unix };
     static constexpr std::string_view toString(Type t);
 

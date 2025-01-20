@@ -66,6 +66,7 @@ constexpr std::chrono::microseconds WebSocketHandler::InitialPingDelayMicroS;
 
 std::atomic<bool> SocketPoll::InhibitThreadChecks(false);
 std::atomic<bool> Socket::InhibitThreadChecks(false);
+std::string Socket::SocketPath("/tmp/coolwsd.sock");
 
 std::unique_ptr<Watchdog> SocketPoll::PollWatchdog;
 
@@ -1092,8 +1093,33 @@ bool ServerSocket::bind([[maybe_unused]] Type type, [[maybe_unused]] int port)
 
     int rc;
 
-    assert (_type != Socket::Type::Unix);
-    if (_type == Socket::Type::IPv4)
+    if (_type == Socket::Type::Unix)
+    {
+        struct sockaddr_un addrunix;
+
+        _socketPath = std::string(Socket::SocketPath);
+        int last_errno = 0;
+        std::memset(&addrunix, 0, sizeof(addrunix));
+        addrunix.sun_family = AF_UNIX;
+        std::memcpy(addrunix.sun_path, _socketPath.c_str(), _socketPath.length());
+        LOG_ASSERT_MSG(addrunix.sun_path[sizeof(addrunix.sun_path) - 1] == '\0',
+                        "addrunix.sun_path is not null terminated");
+
+        rc = ::bind(getFD(), (const sockaddr *)&addrunix, sizeof(struct sockaddr_un));
+        last_errno = errno;
+        LOG_TRC("Binding to Unix socket location ["
+                << &addrunix.sun_path[1] << "], result: " << rc
+                << ((rc >= 0) ? std::string()
+                                : '\t' + Util::symbolicErrno(last_errno) + ": " +
+                                    std::strerror(last_errno)));
+
+        if (rc) {
+            LOG_SYS_ERRNO(last_errno, "Failed to bind to Unix socket at [" << &addrunix.sun_path << ']');
+            return false;
+        }
+        return true;
+    }
+    else if (_type == Socket::Type::IPv4)
     {
         struct sockaddr_in addrv4;
         std::memset(&addrv4, 0, sizeof(addrv4));
@@ -1179,8 +1205,6 @@ std::shared_ptr<Socket> ServerSocket::accept()
     // Accept a connection (if any) and set it to non-blocking.
     // There still need the client's address to filter request from POST(call from REST) here.
 #if !MOBILEAPP
-    assert(_type != Socket::Type::Unix);
-
     UnitWSD* const unitWsd = UnitWSD::isUnitTesting() ? &UnitWSD::get() : nullptr;
     if (unitWsd && unitWsd->simulateExternalAcceptError())
         return nullptr; // Recoverable error, ignore to retry
@@ -1200,51 +1224,63 @@ std::shared_ptr<Socket> ServerSocket::accept()
     LOG_TRC("Accepted socket #" << rc << ", creating socket object.");
 
 #if !MOBILEAPP
-    char addrstr[INET6_ADDRSTRLEN];
-
+    
     Socket::Type type;
-    const void *inAddr;
-    if (clientInfo.sin6_family == AF_INET)
+    std::shared_ptr<Socket> _socket;
+    try 
     {
-        struct sockaddr_in *ipv4 = (struct sockaddr_in *)&clientInfo;
-        inAddr = &(ipv4->sin_addr);
-        type = Socket::Type::IPv4;
-    }
-    else
-    {
-        struct sockaddr_in6 *ipv6 = &clientInfo;
-        inAddr = &(ipv6->sin6_addr);
-        type = Socket::Type::IPv6;
-    }
-    ::inet_ntop(clientInfo.sin6_family, inAddr, addrstr, sizeof(addrstr));
+        if (clientInfo.sin6_family == AF_UNIX) 
+        {
+            type = Socket::Type::Unix;
+            _socket = createSocketFromAccept(rc, type);
+            _socket->setClientAddress("/");
+        }
+        else 
+        {
+            char addrstr[INET6_ADDRSTRLEN];
+            const void *inAddr;
+            if (clientInfo.sin6_family == AF_INET)
+            {
+                struct sockaddr_in *ipv4 = (struct sockaddr_in *)&clientInfo;
+                inAddr = &(ipv4->sin_addr);
+                type = Socket::Type::IPv4;
+            }
+            else
+            {
+                struct sockaddr_in6 *ipv6 = &clientInfo;
+                inAddr = &(ipv6->sin6_addr);
+                type = Socket::Type::IPv6;
+            }
 
-    const size_t extConnCount = StreamSocket::getExternalConnectionCount();
-    if (net::Defaults.maxExtConnections > 0 && extConnCount >= net::Defaults.maxExtConnections)
-    {
-        LOG_WRN("Limiter rejected extConn[" << extConnCount << "/" << net::Defaults.maxExtConnections << "]: #"
-                << rc << " has family "
-                << clientInfo.sin6_family << ", address " << addrstr << ":" << clientInfo.sin6_port);
-        ::close(rc);
-        return nullptr;
-    }
+            ::inet_ntop(clientInfo.sin6_family, inAddr, addrstr, sizeof(addrstr));
+            const size_t extConnCount = StreamSocket::getExternalConnectionCount();
+            if (net::Defaults.maxExtConnections > 0 && extConnCount >= net::Defaults.maxExtConnections)
+            {
+                LOG_WRN("Limiter rejected extConn[" << extConnCount << "/" << net::Defaults.maxExtConnections << "]: #"
+                        << rc << " has family "
+                        << clientInfo.sin6_family << ", address " << addrstr << ":" << clientInfo.sin6_port);
+                ::close(rc);
+                return nullptr;
+            }
+        
+            // Create a socket object using the factory.
+            _socket = createSocketFromAccept(rc, type);
+            if (unitWsd)
+                unitWsd->simulateExternalSocketCtorException(_socket);
 
-    try
-    {
-        // Create a socket object using the factory.
-        std::shared_ptr<Socket> _socket = createSocketFromAccept(rc, type);
-        if (unitWsd)
-            unitWsd->simulateExternalSocketCtorException(_socket);
-
-        _socket->setClientAddress(addrstr, clientInfo.sin6_port);
+            _socket->setClientAddress(addrstr, clientInfo.sin6_port);
+            
+        }
 
         LOG_TRC("Accepted socket #" << _socket->getFD() << " has family "
-                                    << clientInfo.sin6_family << ", " << *_socket);
+                                        << clientInfo.sin6_family << ", " << *_socket);
         return _socket;
-    }
+        }
     catch (const std::exception& ex)
     {
         LOG_ERR("Failed to create client socket #" << rc << ". Error: " << ex.what());
     }
+    
     return nullptr;
 #else
     return createSocketFromAccept(rc, Socket::Type::Unix);
@@ -1276,6 +1312,15 @@ int Socket::getPid() const
 #else
 #error Implement for your platform
 #endif
+}
+
+ServerSocket::~ServerSocket()
+{
+    if (_type == Socket::Type::Unix)
+    {
+        LOG_DBG("Removing socket path [" << _socketPath << "].");
+        ::unlink(_socketPath.c_str());
+    }
 }
 
 // Does this socket come from the localhost ?
